@@ -41,6 +41,15 @@ source .venv/bin/activate
 ```bash
 ultraprompt-gui
 ```
+### Using the GUI
+You can import custom class labels by loading a .txt file with class names on each line, for exmaple: create a file called classes.txt containing
+```php-template
+dog
+cat
+frog
+...
+```
+The GUI will make these classes available for YOLO polygon labels from SAM2 box prompts.
 
 ### 4) Download the SAM2 model weights
 You'll need to have your SAM2 model weights somewhere, download them from here:
@@ -75,6 +84,7 @@ One line per instance with normalized polygon coordinates
 🔹class_id is 0..N-1 from your classes.txt (one class name per line).
 
 🔹Coordinates are normalized to [0,1] by image width/height.
+
 
 
 

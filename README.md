@@ -42,6 +42,12 @@ source .venv/bin/activate
 ultraprompt-gui
 ```
 
+### 4) Download the SAM2 model weights
+You'll need to have your SAM2 model weights somewhere, download them from here:
+https://docs.ultralytics.com/models/sam-2/#how-to-use-sam-2-versatility-in-image-and-video-segmentation
+
+I suggest using sam2.1_b.py for now.
+
 ### Using the core API (no GUI)
 ```python
 from ultraprompt.core.sam_yolo_annotation import UltraSAM2, load_image_rgb
@@ -69,6 +75,7 @@ One line per instance with normalized polygon coordinates
 🔹class_id is 0..N-1 from your classes.txt (one class name per line).
 
 🔹Coordinates are normalized to [0,1] by image width/height.
+
 
 
 

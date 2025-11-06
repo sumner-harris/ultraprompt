@@ -27,6 +27,11 @@ cd ultraprompt
 uv venv
 uv sync
 ```
+or used TLS certificates if needed for corporate networks
+```bash
+uv venv --native-tls 
+```
+
 ### 2) Activate it:
 #### **Windows** (PowerShell)
 ```bash
@@ -84,6 +89,7 @@ One line per instance with normalized polygon coordinates
 🔹class_id is 0..N-1 from your classes.txt (one class name per line).
 
 🔹Coordinates are normalized to [0,1] by image width/height.
+
 
 
 

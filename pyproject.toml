@@ -7,21 +7,21 @@ name = "ultraprompt"
 version = "0.1.0"
 description = "Prompt-guided instance segmentation (SAM2→YOLO) with a clean GUI."
 readme = "README.md"
-requires-python = "==3.11.*"
+requires-python = "~=3.11.*"
 authors = [{name="Sumner B. Harris, Anamika Sen"}]
 license = {text = "MIT"}
 keywords = ["segmentation", "SAM2", "YOLO", "annotation", "Ultralytics"]
 
 dependencies = [
-  "ultralytics>=8.3.0",
-  "torch>=2.3.1",               # CPU by default; use CUDA index for GPU
-  "torchvision>=0.18.1",        # keep paired with your torch version
-  "PySide6>=6.6",
-  "opencv-python>=4.8.0",
-  "Pillow>=10.0.0",
-  "numpy>=1.25.0",
+  "ultralytics>=8.4.9",
+  "torch>=2.10.0",               # CPU by default; use CUDA index for GPU
+  "torchvision>=0.25.0",        # keep paired with your torch version
+  "PySide6>=6.10.1",
+  "opencv-python>=4.13.0",
+  "Pillow>=12.1.0",
+  "numpy>=2.4.0",
   "shapely>=2.0.0",
-  "matplotlib>=3.8.0",
+  "matplotlib>=3.10.0",
 ]
 
 [project.optional-dependencies]

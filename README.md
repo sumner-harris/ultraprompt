@@ -1,15 +1,14 @@
 # ultraprompt
 
-**Ultraprompt** is a lightweight toolchain for creating **class-annotated instance segmentation data for YOLO** using **SAM2**.  
-It lets you interactively add positive/negative points and class-tagged boxes, run SAM2 to generate instance masks, and export **YOLO segmentation (polygons) labels**. Use the GUI for fast labeling or the Python API in notebooks for batch workflows.
+**Ultraprompt** is a lightweight toolchain for creating **class-annotated instance segmentation data for YOLO** using **SAM3**.  
+It lets you interactively add positive/negative points and class-tagged boxes, run SAM3 to generate instance masks, and export **YOLO segmentation (polygons) labels**. Use the GUI for fast labeling or the Python API in notebooks for batch workflows. SAM3 now allows for Promptable Concept Segmentation which streamlines manual labeling tasks significantly!
 
 ## Features
 
-- 🔹 **SAM2 via Ultralytics** for prompted & automatic segmentation  
-- 🔹 **Points (±) + boxes** as hints, per-box class assignment  
+- 🔹 **SAM3 via Ultralytics** for box or text prompted conceptual segmentation
+- 🔹 **Points (±) + boxes** as hints, per-box class assignment for SAM2 compatibility
 - 🔹 **YOLO-Seg export** (`labels/*.txt` with normalized polygons)  
 - 🔹 **Notebook-friendly core API** (no GUI required)  
-
 ---
 
 ## Quickstart (with `uv`)
@@ -56,30 +55,87 @@ frog
 ```
 The GUI will make these classes available for YOLO polygon labels from SAM2 box prompts.
 
-### 4) Download the SAM2 model weights
-You'll need to have your SAM2 model weights somewhere, download them from here:
+### 4) Download the SAM3 or SAM2 model weights
+You'll need to have your model weights somewhere, download SAM2 weights from here:
 https://docs.ultralytics.com/models/sam-2/#how-to-use-sam-2-versatility-in-image-and-video-segmentation
 
-I suggest using sam2.1_b.py for now.
+and download SAM3 weights from here (request access is required): https://huggingface.co/facebook/sam3
 
 ### Using the core API (no GUI)
 ```python
-from ultraprompt.core.sam_yolo_annotation import UltraSAM2, load_image_rgb
+from ultraprompt.core.sam_yolo_annotation import UltraSAM3, load_image_rgb
 
-sam2 = UltraSAM2()
-sam2.load("path/to/sam2_weights.pt", device="auto")  # "cpu" or "cuda" also ok
+# Initialize SAM3 wrapper
+sam = UltraSAM3()
 
+# Load Ultralytics SAM3 weights
+# device can be "auto", "cpu", or "cuda"
+sam.load("path/to/sam3.pt", device="auto")
+
+# Load and bind image
 img = load_image_rgb("path/to/image.jpg")
-sam2.bind_image(img)
+sam.bind_image(img, image_path="path/to/image.jpg")
 
-# Prompts (examples)
-points = [[320, 180], [420, 220]]   # x,y
-labels = [1, 0]                      # 1=foreground, 0=background
-boxes  = [[100, 120, 300, 340]]      # x0,y0,x1,y1
+# --------------------------------------------------
+# Visual prompting (points and/or boxes)
+# --------------------------------------------------
 
-masks = sam2.infer(points=points, labels=labels, boxes=boxes)  # list of boolean (H,W) arrays
-print(f"{len(masks)} mask(s)")
+# Point prompts
+points = [[320, 180], [420, 220]]    # (x, y)
+labels = [1, 0]                      # 1 = foreground, 0 = background
+
+# Box prompts
+boxes = [[100, 120, 300, 340]]       # (x0, y0, x1, y1)
+
+# Run visual SAM3 inference
+masks = sam.infer_visual(
+    points=points,
+    labels=labels,
+    boxes=boxes,
+    multimask_output=True,
+)
+
+print(f"Visual mode: {len(masks)} mask(s) returned")
+
+# Each mask is a boolean (H, W) NumPy array
+# masks[i][y, x] == True indicates foreground
+
+
+# --------------------------------------------------
+# Concept / semantic prompting (text and/or boxes)
+# --------------------------------------------------
+
+# Text concepts
+concepts = ["person", "bus"]
+
+# Optional: exemplar boxes that define the concept visually
+exemplar_boxes = [
+    [100, 120, 300, 340],
+    [420, 160, 560, 420],
+]
+
+# Run concept segmentation
+concept_masks = sam.infer_concept(
+    text=concepts,          # list of strings or None
+    exemplars=exemplar_boxes,  # list of boxes or None
+)
+
+print(f"Concept mode: {len(concept_masks)} mask(s) returned")
+
+# --------------------------------------------------
+# Segment-everything (no prompts)
+# --------------------------------------------------
+
+all_masks = sam.segment_everything(img, top_n=20)
+print(f"Segment-everything: {len(all_masks)} mask(s)")
 ```
+## Keeping SAM2 backwards compatibility with an alias.
+```python
+# UltraSAM2 is kept as an alias for backward compatibility
+from ultraprompt.core.sam_yolo_annotation import UltraSAM2
+sam = UltraSAM2()  # same as UltraSAM3
+```
+
 
 ### Export format (YOLO-Seg)
 One line per instance with normalized polygon coordinates
@@ -89,6 +145,7 @@ One line per instance with normalized polygon coordinates
 🔹class_id is 0..N-1 from your classes.txt (one class name per line).
 
 🔹Coordinates are normalized to [0,1] by image width/height.
+
 
 
 

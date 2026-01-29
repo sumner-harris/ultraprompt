@@ -19,6 +19,14 @@ except Exception:
     _HAS_PIL = False
 
 from ultralytics import SAM
+try:
+    # SAM 3 semantic (concept) segmentation predictor
+    from ultralytics.models.sam import SAM3SemanticPredictor
+    _HAS_SAM3_SEMANTIC = True
+except Exception:
+    SAM3SemanticPredictor = None  # type: ignore
+    _HAS_SAM3_SEMANTIC = False
+
 
 
 # -------------------- Utilities --------------------
@@ -71,6 +79,20 @@ def _best_mask_from_results(res_list) -> Optional[np.ndarray]:
         m = m[0]
     return (m > 0.5).astype(bool)
 
+
+
+def _all_masks_from_results(res_list) -> List[np.ndarray]:
+    """Return all masks from the first Results item as boolean (H,W) arrays."""
+    if not res_list:
+        return []
+    res = res_list[0]
+    if getattr(res, "masks", None) is None:
+        return []
+    mm = res.masks.data  # tensor (N,H,W) float
+    m = mm.cpu().numpy()
+    if m.ndim != 3:
+        return []
+    return [(m[i] > 0.5).astype(bool) for i in range(m.shape[0])]
 
 def colorize_masks_rgba(masks: List[np.ndarray], alpha: float = 0.45) -> Optional[np.ndarray]:
     """Return an RGBA overlay from boolean masks."""
@@ -131,60 +153,124 @@ def write_yolo_seg(label_path: Path,
 
 # -------------------- UltraSAM2 wrapper --------------------
 
-class UltraSAM2:
+
+# -------------------- UltraSAM3 wrapper --------------------
+
+class UltraSAM3:
     """
-    Thin wrapper around Ultralytics SAM2 that does NOT use `.predictor`.
-    It calls the model directly with the image and prompt kwargs each time.
+    Thin wrapper around Ultralytics' SAM interface that supports:
+
+      1) Visual segmentation (SAM 2-style): points/boxes/masks -> single instance
+         - Implemented via `ultralytics.SAM` using `sam3.pt` (or other SAM weights).
+
+      2) Concept segmentation (SAM 3 PCS): text prompts and/or exemplar boxes -> *all* instances
+         - Implemented via `ultralytics.models.sam.SAM3SemanticPredictor`.
+
+    Notes:
+      - Visual prompting works by calling the SAM model directly each time (no `.predictor` usage).
+      - Concept prompting uses the SAM3SemanticPredictor, and (for now) expects an image *path*
+        for `set_image()`. The GUI always has a file path, so this keeps things simple.
 
     Usage:
-        sam2 = UltraSAM2()
-        sam2.load(weights_path, device="auto")
+        sam = UltraSAM3()
+        sam.load("sam3.pt", device="auto")
+
         img = load_image_rgb("image.png")
-        sam2.bind_image(img)
+        sam.bind_image(img, image_path="image.png")
 
-        # prompted with points and/or boxes
-        masks = sam2.infer(points=[[x,y], ...], labels=[1,0,...], boxes=[[x0,y0,x1,y1], ...])
+        # Visual prompts (points/boxes)
+        masks = sam.infer_visual(points=[[x,y], ...], labels=[1,0,...], boxes=[[x0,y0,x1,y1], ...])
 
-        # or automatic segment-everything
-        masks = sam2.segment_everything(top_n=20)
+        # Concept prompts (text and/or exemplar boxes)
+        masks = sam.infer_concept(text=["person", "bus"], exemplars=[[x0,y0,x1,y1]])
     """
 
     def __init__(self) -> None:
+        # Visual model (SAM interface) - supports SAM2 + SAM3 PVS
         self.model: Optional[SAM] = None
+        # Semantic predictor (SAM3 PCS)
+        self.semantic: Optional["SAM3SemanticPredictor"] = None  # type: ignore[name-defined]
         self._device: str = "cpu"
+
         self._last_image: Optional[np.ndarray] = None
+        self._last_image_path: Optional[str] = None
+
+        # Keep the predictor overrides around so we can rebuild if device changes
+        self._semantic_overrides: Optional[dict] = None
 
     @property
     def device(self) -> str:
         return self._device
 
-    def load(self, weights: Path | str, device: str | None = "auto") -> None:
-        """Load SAM2 weights and move to device."""
+    def load(
+        self,
+        weights: Path | str,
+        device: str | None = "auto",
+        *,
+        semantic_conf: float = 0.25,
+        semantic_half: bool = True,
+        verbose: bool = False,
+    ) -> None:
+        """Load SAM weights and (optionally) initialize SAM3 semantic predictor."""
         self._device = effective_device(device)
+
+        # Visual prompting model (works for sam3.pt too)
         self.model = SAM(str(weights))
         try:
             self.model.to(self._device)  # no-op on some builds; safe to try
         except Exception:
             pass
 
+        # Concept segmentation predictor (SAM3 only). Safe to skip if deps unavailable.
+        self.semantic = None
+        self._semantic_overrides = None
+        if _HAS_SAM3_SEMANTIC:
+            # Ultralytics docs recommend SAM3SemanticPredictor(overrides=...)
+            self._semantic_overrides = dict(
+                conf=float(semantic_conf),
+                task="segment",
+                mode="predict",
+                model=str(weights),
+                half=bool(semantic_half),
+                verbose=bool(verbose),
+                device=self._device,
+                save=False
+            )
+            try:
+                self.semantic = SAM3SemanticPredictor(overrides=self._semantic_overrides)  # type: ignore[call-arg]
+            except Exception:
+                # Keep visual segmentation working even if semantic init fails.
+                print("SAM3SemanticPredictor init failed:", e)
+                self.semantic = None
+
     def _ensure_ready(self) -> None:
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load(weights_path) first.")
 
-    def bind_image(self, image_rgb: np.ndarray) -> None:
-        """Cache the image for subsequent infer/segment_everything calls."""
+    def bind_image(self, image_rgb: np.ndarray, image_path: Path | str | None = None) -> None:
+        """Cache the image for subsequent calls. Provide `image_path` to enable concept segmentation."""
         self._ensure_ready()
         self._last_image = image_rgb
+        self._last_image_path = str(image_path) if image_path is not None else None
 
-    def infer(
+        # For semantic predictor, we set the image once.
+        if self.semantic is not None and self._last_image_path is not None:
+            try:
+                self.semantic.set_image(self._last_image_path)
+            except Exception:
+                # Don't hard-fail; caller may still use visual segmentation.
+                pass
+
+    # ---------- Visual segmentation (SAM2-style prompts) ----------
+    def infer_visual(
         self,
         points: Optional[Sequence[Sequence[float]]] = None,
         labels: Optional[Sequence[int]] = None,
         boxes: Optional[Sequence[Sequence[float]]] = None,
-        multimask_output: bool = True,  # kept for compatibility, not passed to model()
+        multimask_output: bool = True,  # kept for compatibility, not passed through
     ) -> List[np.ndarray]:
         """
-        Run prompted segmentation. Returns a list of boolean masks.
+        Run SAM visual prompting. Returns a list of boolean masks.
 
         Behavior:
           - If `boxes` are provided: returns ONE mask per box. `points/labels` are global hints.
@@ -214,7 +300,7 @@ class UltraSAM2:
                     kwargs["points"] = pts_b
                 if labs_b is not None:
                     kwargs["labels"] = labs_b
-                res_list = self.model(self._last_image, **kwargs)
+                res_list = self.model(self._last_image, **kwargs)  # type: ignore[misc]
                 m = _best_mask_from_results(res_list)
                 if m is not None:
                     masks_out.append(m)
@@ -226,7 +312,7 @@ class UltraSAM2:
                 kwargs["points"] = pts_b
             if labs_b is not None:
                 kwargs["labels"] = labs_b
-            res_list = self.model(self._last_image, **kwargs)
+            res_list = self.model(self._last_image, **kwargs)  # type: ignore[misc]
             m = _best_mask_from_results(res_list)
             if m is not None:
                 masks_out.append(m)
@@ -235,16 +321,13 @@ class UltraSAM2:
         return []
 
     def segment_everything(self, image_rgb: np.ndarray | None = None, top_n: int = 20) -> List[np.ndarray]:
-        """
-        Segment everything in the current (or provided) image.
-        Returns up to top_n masks (largest areas first) as boolean arrays.
-        """
+        """Segment everything in the current (or provided) image using the SAM interface."""
         self._ensure_ready()
         img = image_rgb if image_rgb is not None else self._last_image
         if img is None:
             raise RuntimeError("No image provided/bound for segment_everything().")
 
-        res = self.model(img, device=self._device, verbose=False)[0]
+        res = self.model(img, device=self._device, verbose=False)[0]  # type: ignore[misc]
         masks_out: List[np.ndarray] = []
         if res.masks is not None:
             mm = res.masks.data.cpu().numpy()  # (N,H,W)
@@ -253,3 +336,53 @@ class UltraSAM2:
             for i in keep:
                 masks_out.append((mm[i] > 0.5).astype(bool))
         return masks_out
+
+    # ---------- Concept segmentation (SAM3 PCS prompts) ----------
+    def infer_concept(
+        self,
+        *,
+        text: Optional[Sequence[str]] = None,
+        exemplars: Optional[Sequence[Sequence[float]]] = None,
+    ) -> List[np.ndarray]:
+        """Run SAM3 Promptable Concept Segmentation (PCS).
+
+        Args:
+          text: list of noun phrases (e.g. ["person", "bus"]).
+          exemplars: list of exemplar bboxes [[x0,y0,x1,y1], ...] to find similar instances.
+
+        Returns:
+          List of boolean masks, one per detected instance.
+        """
+
+        if self.semantic is None:
+            raise RuntimeError(
+                "SAM3SemanticPredictor is not available. "
+                "Ensure ultralytics>=8.3.237 and required deps (e.g., Ultralytics CLIP) are installed."
+            )
+        if not self._last_image_path:
+            raise RuntimeError(
+                f"Concept segmentation requires a non-empty image_path. Got: {self._last_image_path!r}. "
+                "Call bind_image(..., image_path=str(path))."
+            )
+
+        # Ensure the predictor has the current image set (safe to call repeatedly).
+        try:
+            self.semantic.set_image(self._last_image_path)
+        except Exception:
+            pass
+
+        kwargs = {}
+        if text:
+            kwargs["text"] = list(text)
+        if exemplars:
+            kwargs["bboxes"] = [[float(x0), float(y0), float(x1), float(y1)] for (x0, y0, x1, y1) in exemplars]
+
+        if not kwargs:
+            return []
+
+        res_list = self.semantic(**kwargs)
+        return _all_masks_from_results(res_list)
+
+
+# Backwards-compat alias (older GUI/imports)
+UltraSAM2 = UltraSAM3

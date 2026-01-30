@@ -25,6 +25,7 @@ Clone or download the repo and set up a virtual environment with UV
 cd ultraprompt
 uv venv
 uv sync
+uv pip install git+https://github.com/ultralytics/CLIP.git
 ```
 or use TLS certificates if needed for corporate networks
 ```bash
@@ -145,6 +146,7 @@ One line per instance with normalized polygon coordinates
 🔹class_id is 0..N-1 from your classes.txt (one class name per line).
 
 🔹Coordinates are normalized to [0,1] by image width/height.
+
 
 
 

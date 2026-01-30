@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Your optional Jupyter tools
-extras = ["clip @ git+https://github.com/ultralytics/CLIP.git"]
+extras = ["clip @ git+https://github.com/ultralytics/CLIP.git@643beff3883b5720d94b6b9c9eca12fa9fb72fb1"]
 notebook = [
   "notebook>=7.0.0",
   "ipykernel>=6.25.0",

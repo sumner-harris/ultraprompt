@@ -155,3 +155,119 @@ One line per instance with normalized polygon coordinates
 
 
 
+
+
+
+
+---
+---
+
+## YOLO Training Tab
+
+This fork extends ultraprompt with a **YOLO Training Tab**, a
+second tab in the GUI that takes your SAM3-annotated labels and
+trains a YOLO instance segmentation model, all without leaving
+the application.
+
+The intended workflow is:
+```
+SAM3 Annotate tab  →  export YOLO labels
+YOLO Training tab  →  build dataset → train → evaluate
+```
+
+### Additional dependencies
+
+The YOLO Training Tab requires a few extra packages not in the
+base install:
+```
+uv add pandas matplotlib ultralytics
+```
+
+### YOLO Training Tab features
+
+* 🔹 **Dataset Builder**: point to your images folder and labels
+  folder, set train/val/test split ratios, and the tab builds the
+  full YOLO dataset folder structure and writes `data.yaml`
+  automatically — auto-filling the path in the training config
+* 🔹 **Device selection** : auto-detects CPU or GPU on startup;
+  works on Windows PC (CPU) and Linux with CUDA GPU
+* 🔹 **Model selection** : choose from yolo26n/s/m/l/x or yolov8
+  variants; weights are auto-downloaded from Ultralytics on first
+  use, or browse to a custom `.pt` file
+* 🔹 **Hyperparameter fields** : all key training parameters
+  pre-filled with defaults optimised by Ray Tune (150 trials,
+  A100 GPU, RHEED segmentation dataset, 4 classes)
+* 🔹 **Live training log** : coloured terminal streams YOLO output
+  in real time showing epoch progress, losses, and metrics
+* 🔹 **Live plots** : loss curves and mAP curves update every 30s
+  during training without blocking the UI
+* 🔹 **Confusion matrix** : displayed automatically in a dedicated
+  tab when training completes
+* 🔹 **Metrics table** : mAP50, mAP50-95, precision, and recall
+  for both box and mask, updated each poll interval
+* 🔹 **Load existing results** : browse to any past `results.csv`
+  to view plots and metrics without retraining
+
+### Platform notes
+
+- **Windows**: `workers` is automatically set to `0` to prevent
+  a Python multiprocessing crash. If training crashes immediately,
+  try unchecking **Mixed precision AMP** in the Options section.
+- **Linux / Mac**: `workers` defaults to `4` for faster data
+  loading. Adjust in the hyperparameter fields if needed.
+- **GPU**: select your GPU from the Device dropdown. If you get
+  an out-of-memory error, reduce the batch size.
+- **CPU**: works on any machine for testing, but training will
+  be slow. Use a small image size (640) and batch size (2) for
+  quick tests.
+
+### Viewing results from past training runs
+
+The **Load Existing results.csv** button lets you view plots and
+metrics from any previously completed training run without
+retraining:
+
+1. Click **Load Existing results.csv**
+2. Browse to the `results.csv` file inside your training output
+   folder, for example:
+
+   runs_final/yolo_run_1/results.csv
+
+3. The Loss Curves, mAP Curves, and Metrics table are populated
+   instantly
+4. If a `confusion_matrix_normalized.png` exists in the same
+   folder it is loaded automatically into the Confusion Matrix tab
+
+
+### Default hyperparameters
+
+Defaults come from Ray Tune Bayesian optimisation (150 trials,
+yolo26n-seg, Reflection high energy electron difrraction (RHEED) dataset):
+
+| Parameter  | Default  | Description              |
+|------------|----------|--------------------------|
+| epochs     | 200      | training epochs          |
+| imgsz      | 1280     | input image size         |
+| batch      | 8        | batch size (reduce if OOM)|
+| cls        | 0.391    | class loss weight        |
+| conf       | 0.276    | confidence threshold     |
+| dropout    | 0.248    | regularization           |
+| mask_ratio | 4        | mask resolution divisor  |
+| lr0        | 0.000503 | initial learning rate    |
+| box        | 11.779   | box loss weight          |
+
+These achieved mAP50-95(M) = 0.3485 versus a manual baseline
+of 0.1761 on the RHEED dataset.
+### Typical usage
+
+1. Use the **SAM3 Annotate** tab to label your images and export
+   YOLO `.txt` label files
+2. Switch to the **YOLO Training** tab
+3. In **Dataset Builder**: select your images folder, labels
+   folder, and output folder then click **Build Dataset**
+4. The `data.yaml` path is auto-filled in the training config
+5. Select your model, adjust hyperparameters if needed
+6. Click **Start Training** then watch the live log and plots
+7. When complete, best weights path is shown in a popup
+
+

@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 import numpy as np
+# Import YOLO Training tab 
+from ultraprompt.gui.yolo_training_tab import YoloTrainingTab  
 import json
 import traceback
 
@@ -20,8 +22,11 @@ from PySide6.QtGui import QAction, QPixmap, QPainter, QPen, QBrush, QImage, QCol
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QToolBar, QLabel,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsEllipseItem,
-    QGraphicsRectItem, QMessageBox, QStatusBar, QComboBox, QLineEdit, QSizePolicy
+    QGraphicsRectItem, QMessageBox, QStatusBar, QComboBox, QLineEdit, QSizePolicy,
+    QTabWidget, QWidget, QVBoxLayout    
 )
+
+
 
 
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
@@ -83,7 +88,22 @@ class SamPromptAnnotator(QMainWindow):
         self.concept_text: str = ""
         self.scene = QGraphicsScene(self)
         self.view = GraphicsView(self.scene, self)
+        # Wrap everything in a tab widget (newly added)
+        self._tab_widget = QTabWidget(self)
+        # SAM3 tab wraps the existing GraphicsView
+        self._sam_tab = QWidget()
+        sam_layout    = QVBoxLayout(self._sam_tab)
+        sam_layout.setContentsMargins(0, 0, 0, 0)
+        sam_layout.addWidget(self.view)
+        # YOLO Training tab
+        self._yolo_tab = YoloTrainingTab()
+
+        self._tab_widget.addTab(self._sam_tab,  "🖊️  SAM3 Annotate")
+        self._tab_widget.addTab(self._yolo_tab, "🏋️  YOLO Training")
+
+        self.setCentralWidget(self._tab_widget)
         self.setCentralWidget(self.view)
+        #---------------------------------------------
         self.pixmap_item: Optional[QGraphicsPixmapItem] = None
         self.seg_item: Optional[QGraphicsPixmapItem] = None
 
@@ -778,10 +798,28 @@ class SamPromptAnnotator(QMainWindow):
             QMessageBox.critical(self, "SAM3 error", tb)
 
 
+
 def main():
     app = QApplication(sys.argv)
-    win = SamPromptAnnotator()
-    win.show()
+
+    # ── Main window with two tabs ──────────────────────────────────────
+    from PySide6.QtWidgets import QMainWindow, QTabWidget
+    main_win = QMainWindow()
+    main_win.setWindowTitle('ultraprompt')
+    main_win.resize(1400, 900)
+
+    tabs = QTabWidget()
+    main_win.setCentralWidget(tabs)
+
+    # Tab 1 — existing SAM3 annotator
+    annotator = SamPromptAnnotator()
+    tabs.addTab(annotator, '🖼️  SAM3 Annotate')
+
+    # Tab 2 — new YOLO training tab
+    yolo_tab = YoloTrainingTab()
+    tabs.addTab(yolo_tab, '🏋️  YOLO Training')
+
+    main_win.show()
     sys.exit(app.exec_())
 
 

@@ -47,17 +47,94 @@ def effective_device(pref: Optional[str]) -> str:
     return "cpu"
 
 
+def _to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
+    """Convert grayscale/RGB scientific image arrays to HxWx3 uint8 RGB."""
+    arr = np.asarray(arr)
+
+    # If multipage or stack-like, take the first plane by default.
+    # Common shapes:
+    #   HxW
+    #   HxWxC
+    #   ZxHxW
+    #   ZxHxWxC
+    while arr.ndim > 3:
+        arr = arr[0]
+
+    # Channel-first RGB/RGBA -> channel-last
+    if arr.ndim == 3 and arr.shape[0] in (3, 4) and arr.shape[-1] not in (3, 4):
+        arr = np.moveaxis(arr, 0, -1)
+
+    # Stack-like ZxHxW -> take first plane
+    if arr.ndim == 3 and arr.shape[-1] not in (3, 4):
+        arr = arr[0]
+
+    # Grayscale -> RGB
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+
+    # RGBA or extra channels -> RGB
+    if arr.ndim == 3 and arr.shape[-1] >= 4:
+        arr = arr[..., :3]
+
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        raise RuntimeError(f"Unsupported image shape after TIFF load: {arr.shape}")
+
+    # Already uint8
+    if arr.dtype == np.uint8:
+        return np.ascontiguousarray(arr)
+
+    # Normalize scientific/intensity images to uint8.
+    arr = arr.astype(np.float32)
+    finite = np.isfinite(arr)
+
+    if not finite.any():
+        return np.zeros(arr.shape, dtype=np.uint8)
+
+    vals = arr[finite]
+    lo, hi = np.percentile(vals, [0.5, 99.5])
+
+    if hi <= lo:
+        lo, hi = float(vals.min()), float(vals.max())
+
+    if hi <= lo:
+        return np.zeros(arr.shape, dtype=np.uint8)
+
+    arr = np.clip((arr - lo) / (hi - lo), 0, 1)
+    arr = (arr * 255).astype(np.uint8)
+    return np.ascontiguousarray(arr)
+
+
 def load_image_rgb(path: Path | str) -> np.ndarray:
-    """Read image as HxWx3 RGB uint8."""
+    """Read image as HxWx3 RGB uint8, including scientific TIFFs."""
     p = str(path)
+    suffix = Path(p).suffix.lower()
+
+    # Use tifffile first for TIFFs, because OpenCV often fails on
+    # 16/32-bit scientific TIFFs and vendor metadata.
+    if suffix in {".tif", ".tiff"}:
+        try:
+            import tifffile
+            arr = tifffile.imread(p)
+            return _to_uint8_rgb(arr)
+        except Exception as e:
+            tiff_err = e
+        # Continue to other loaders below before giving up.
+
     if _HAS_CV2:
         im = cv2.imread(p, cv2.IMREAD_COLOR)
-        if im is None:
-            raise RuntimeError(f"cv2 failed to read: {p}")
-        return cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+        if im is not None:
+            return cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
     if _HAS_PIL:
-        return np.array(Image.open(p).convert("RGB"))
-    raise RuntimeError("Need OpenCV or PIL to read images.")
+        try:
+            return np.array(Image.open(p).convert("RGB"))
+        except Exception:
+            pass
+
+    if suffix in {".tif", ".tiff"}:
+        raise RuntimeError(f"Failed to read TIFF with tifffile/OpenCV/PIL: {p}; tifffile error: {tiff_err}")
+
+    raise RuntimeError(f"Failed to read image: {p}")
 
 
 def _best_mask_from_results(res_list) -> Optional[np.ndarray]:

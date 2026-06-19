@@ -35,9 +35,17 @@ notebook = [
   # "jupyterlab>=4.0.0",  # include if you prefer Lab
 ]
 dev = ["pytest", "pytest-cov", "ruff", "mypy", "ipython"]
+web = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+]
 
 [project.scripts]
 ultraprompt-gui = "ultraprompt.gui:main"
+ultraprompt-web = "ultraprompt.web:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ultraprompt"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/ultraprompt/web/static" = "ultraprompt/web/static"

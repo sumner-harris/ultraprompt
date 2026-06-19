@@ -7,29 +7,38 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 import numpy as np
-# Import YOLO Training tab 
-from ultraprompt.gui.yolo_training_tab import YoloTrainingTab  
+from PIL import Image
 import json
+import tempfile
+import time
 import traceback
 
 # ---- import the core module (no predictor usage inside) ----
 from ultraprompt.core.sam_yolo_annotation import (
     UltraSAM3, load_image_rgb, colorize_masks_rgba, mask_to_polygon, write_yolo_seg
 )
+from ultraprompt.core.convert_scientific_tiffs import convert_if_required
+from ultraprompt.core.image_preprocessing import (
+    ImagePreprocessSettings, preprocess_image_rgb, scale_polygon
+)
 
-from PySide6.QtCore import Qt, QRectF, QPointF, QEvent
+from PySide6.QtCore import Qt, QRectF, QPointF, QEvent, QElapsedTimer
 from PySide6.QtGui import QAction, QPixmap, QPainter, QPen, QBrush, QImage, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QToolBar, QLabel,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsEllipseItem,
     QGraphicsRectItem, QMessageBox, QStatusBar, QComboBox, QLineEdit, QSizePolicy,
-    QTabWidget, QWidget, QVBoxLayout    
+    QTabWidget, QWidget, QVBoxLayout, QSpinBox    
 )
 
 
 
 
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
+
+
+def file_dialog_options():
+    return QFileDialog.Option.DontUseNativeDialog
 
 
 def clamp(v, a, b): return max(a, min(b, v))
@@ -41,10 +50,22 @@ def np_to_qimage_rgba(img_rgba: np.ndarray) -> QImage:
     return QImage(img_rgba.data, w, h, 4*w, QImage.Format_RGBA8888)
 
 
+def np_to_qimage_rgb(img_rgb: np.ndarray) -> QImage:
+    h, w, c = img_rgb.shape
+    assert c == 3 and img_rgb.dtype == np.uint8
+    img_rgb = np.ascontiguousarray(img_rgb)
+    return QImage(img_rgb.data, w, h, 3*w, QImage.Format_RGB888).copy()
+
+
 class GraphicsView(QGraphicsView):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.setRenderHints(self.renderHints() | self.renderHints())
+        self.setRenderHint(QPainter.Antialiasing, False)
+        self.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        self.setOptimizationFlag(QGraphicsView.DontSavePainterState, True)
+        self.setOptimizationFlag(QGraphicsView.DontAdjustForAntialiasing, True)
+        self.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
+        self.setCacheMode(QGraphicsView.CacheBackground)
         self.setDragMode(QGraphicsView.RubberBandDrag)
         self._hand_drag_active = False
 
@@ -81,27 +102,22 @@ class SamPromptAnnotator(QMainWindow):
         self.image_dir: Optional[Path] = None
         self.out_dir: Optional[Path] = None
         self.image_paths: List[Path] = []
+        self.converted_image_sources: dict[Path, Path] = {}
         self.idx: int = -1
+        self.current_base_size: Tuple[int, int] = (0, 0)
+        self.current_display_size: Tuple[int, int] = (0, 0)
+        self.current_sam_image: Optional[np.ndarray] = None
+        self.current_sam_image_path: Optional[Path] = None
 
         # UI state
-        self.mode: str = "points"  # "points" | "boxes" | "concept"
+        self.mode: str = "points"  # "points" | "boxes" | "concept" | "brush"
         self.concept_text: str = ""
+        self._brush_active = False
+        self._brush_erase = False
+        self._brush_dirty = False
+        self._last_brush_preview_ms: int = 0
         self.scene = QGraphicsScene(self)
         self.view = GraphicsView(self.scene, self)
-        # Wrap everything in a tab widget (newly added)
-        self._tab_widget = QTabWidget(self)
-        # SAM3 tab wraps the existing GraphicsView
-        self._sam_tab = QWidget()
-        sam_layout    = QVBoxLayout(self._sam_tab)
-        sam_layout.setContentsMargins(0, 0, 0, 0)
-        sam_layout.addWidget(self.view)
-        # YOLO Training tab
-        self._yolo_tab = YoloTrainingTab()
-
-        self._tab_widget.addTab(self._sam_tab,  "🖊️  SAM3 Annotate")
-        self._tab_widget.addTab(self._yolo_tab, "🏋️  YOLO Training")
-
-        self.setCentralWidget(self._tab_widget)
         self.setCentralWidget(self.view)
         #---------------------------------------------
         self.pixmap_item: Optional[QGraphicsPixmapItem] = None
@@ -117,11 +133,24 @@ class SamPromptAnnotator(QMainWindow):
         self._drawing_box = False
         self._box_start_scene: Optional[QPointF] = None
         self._current_box_item: Optional[QGraphicsRectItem] = None
+        self._last_box_update_ms: int = 0
+        self._box_update_timer = QElapsedTimer()
+        self._box_update_timer.start()
 
         # SAM2 core wrapper
         self.sam = UltraSAM3()
         self.sam3_weights: Optional[Path] = None
         self.device_pref: str = "Auto"  # Auto / CUDA / CPU
+        self.filter_options = [
+            ("None", "none"),
+            ("Gaussian", "gaussian"),
+            ("Median", "median"),
+            ("Bilateral", "bilateral"),
+            ("DoG Fine", "dog_fine"),
+            ("DoG Medium", "dog_medium"),
+            ("DoG Coarse", "dog_coarse"),
+            ("Sharpen", "sharpen"),
+        ]
 
         # Classes + export state
         self.class_names: List[str] = ["object"]
@@ -134,6 +163,7 @@ class SamPromptAnnotator(QMainWindow):
         # per-run / session accumulators (append-only history)
         self.all_run_masks: List[np.ndarray] = []       # stored masks (H x W uint8/bool)
         self.all_run_mask_classes: List[int] = []       # class id for each appended mask
+        self.label_map: Optional[np.ndarray] = None     # H x W int16, -1 means unlabeled
 
         self._build_ui()
         self._install_event_filters()
@@ -165,16 +195,19 @@ class SamPromptAnnotator(QMainWindow):
         self.act_mode_points  = QAction("Points Mode", self, checkable=True)
         self.act_mode_boxes   = QAction("Boxes Mode",  self, checkable=True)
         self.act_mode_concept = QAction("Concept Mode", self, checkable=True)
+        self.act_mode_brush   = QAction("Brush Mode", self, checkable=True)
         
         # keep them mutually exclusive without needing QActionGroup
         self.act_mode_points.setChecked(True)
         self.act_mode_points.triggered.connect(lambda: self.set_mode("points"))
         self.act_mode_boxes.triggered.connect(lambda: self.set_mode("boxes"))
         self.act_mode_concept.triggered.connect(lambda: self.set_mode("concept"))
+        self.act_mode_brush.triggered.connect(lambda: self.set_mode("brush"))
         
         tb2.addAction(self.act_mode_points)
         tb2.addAction(self.act_mode_boxes)
         tb2.addAction(self.act_mode_concept)
+        tb2.addAction(self.act_mode_brush)
         
         # --- Concept prompt UI (toolbar widget action) ---
         self.lbl_concepts = QLabel(" Concepts: ")
@@ -213,6 +246,30 @@ class SamPromptAnnotator(QMainWindow):
         self.cmb_device.currentTextChanged.connect(self._on_device_changed)
         tb1.addWidget(QLabel(" Device: ")); tb1.addWidget(self.cmb_device)
 
+        # --- SAM preprocessing UI ---
+        tb2.addSeparator()
+        tb2.addWidget(QLabel(" Pixel: "))
+        self.cmb_pixel_scale = QComboBox(self)
+        self.cmb_pixel_scale.addItems(["1x", "2x", "4x", "8x"])
+        self.cmb_pixel_scale.setFixedWidth(72)
+        self.cmb_pixel_scale.currentTextChanged.connect(self._on_preprocess_changed)
+        tb2.addWidget(self.cmb_pixel_scale)
+
+        tb2.addWidget(QLabel(" Filter: "))
+        self.cmb_filter = QComboBox(self)
+        for label, key in self.filter_options:
+            self.cmb_filter.addItem(label, key)
+        self.cmb_filter.setFixedWidth(130)
+        self.cmb_filter.currentTextChanged.connect(self._on_preprocess_changed)
+        tb2.addWidget(self.cmb_filter)
+
+        tb2.addWidget(QLabel(" Brush: "))
+        self.spin_brush = QSpinBox(self)
+        self.spin_brush.setRange(1, 200)
+        self.spin_brush.setValue(12)
+        self.spin_brush.setFixedWidth(72)
+        tb2.addWidget(self.spin_brush)
+
         # --- Classes UI ---
         self.cmb_class = QComboBox(self)
         self.cmb_class.addItems(self.class_names)
@@ -243,9 +300,50 @@ class SamPromptAnnotator(QMainWindow):
         self.concept_text = txt
         if self.mode == "concept":
             self._update_status("concept text updated")
+
+    def _current_preprocess_settings(self) -> ImagePreprocessSettings:
+        txt = self.cmb_pixel_scale.currentText() if hasattr(self, "cmb_pixel_scale") else "1x"
+        try:
+            pixel_scale = int(txt.rstrip("x"))
+        except Exception:
+            pixel_scale = 1
+        filter_name = "none"
+        if hasattr(self, "cmb_filter"):
+            data = self.cmb_filter.currentData()
+            filter_name = str(data or "none")
+        return ImagePreprocessSettings(pixel_scale=pixel_scale, filter_name=filter_name)
+
+    def _preprocess_metadata(self) -> dict:
+        settings = self._current_preprocess_settings()
+        base_w, base_h = self.current_base_size
+        view_w, view_h = self.current_display_size
+        return {
+            "pixel_scale": int(settings.pixel_scale),
+            "filter": settings.filter_name,
+            "source_size": [int(base_w), int(base_h)],
+            "annotation_size": [int(view_w), int(view_h)],
+        }
+
+    def _json_matches_current_preprocess(self, data: dict) -> bool:
+        settings = self._current_preprocess_settings()
+        meta = data.get("preprocess")
+        if not meta:
+            return settings.pixel_scale == 1 and settings.filter_name == "none"
+        return (
+            int(meta.get("pixel_scale", 1)) == int(settings.pixel_scale)
+            and str(meta.get("filter", "none")) == settings.filter_name
+            and list(meta.get("annotation_size", [])) == [self.current_display_size[0], self.current_display_size[1]]
+        )
+
+    def _on_preprocess_changed(self, *_args):
+        if not self.image_paths or self.idx < 0:
+            self._update_status("Preprocess set")
+            return
+        self.load_image()
+        self._update_status("Preprocess updated")
             
     def load_classes_txt(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Select classes.txt", "", "Text files (*.txt);;All files (*)")
+        f, _ = QFileDialog.getOpenFileName(self, "Select classes.txt", "", "Text files (*.txt);;All files (*)", options=file_dialog_options())
         if not f:
             return
         try:
@@ -269,24 +367,69 @@ class SamPromptAnnotator(QMainWindow):
         parts = []
         parts.append(f"Mode: {self.mode.upper()}")
         if self.image_paths: parts.append(f"Image {self.idx+1}/{len(self.image_paths)}")
+        if self.pixmap_item:
+            settings = self._current_preprocess_settings()
+            filter_label = settings.filter_name.replace("_", " ")
+            parts.append(f"SAM view: {self.current_display_size[0]}x{self.current_display_size[1]} @ {settings.pixel_scale}x, {filter_label}")
         if self.sam3_weights: parts.append(f"SAM3: {self.sam3_weights.name} @ {self._effective_device()}")
         if extra: parts.append(f"— {extra}")
         self.info.setText(" | ".join(parts))
 
     # ---------- File ops ----------
     def open_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Image Folder")
+        d = QFileDialog.getExistingDirectory(self, "Select Image Folder", "", file_dialog_options())
         if not d: return
         self.image_dir = Path(d)
-        self.image_paths = [p for p in sorted(self.image_dir.iterdir()) if p.suffix.lower() in IMG_EXTS]
-        if not self.image_paths:
+        raw_paths = [p for p in sorted(self.image_dir.iterdir()) if p.suffix.lower() in IMG_EXTS]
+        if not raw_paths:
             QMessageBox.warning(self, "No Images", "No images found in that folder."); return
+        self.image_paths, converted_count = self._prepare_image_paths(raw_paths)
         self.idx = 0
         self.load_image()
-        self._update_status("Folder loaded")
+        msg = "Folder loaded"
+        if converted_count:
+            msg += f"; using converted PNGs for {converted_count} scientific TIFF(s)"
+        self._update_status(msg)
+
+    def _prepare_image_paths(self, paths: List[Path]) -> Tuple[List[Path], int]:
+        self.converted_image_sources.clear()
+        prepared: List[Path] = []
+        converted_count = 0
+        conversion_errors: List[str] = []
+
+        if not self.image_dir:
+            return paths, 0
+
+        conversion_dir = self.image_dir.parent / f"{self.image_dir.name}_uint8"
+        for src in paths:
+            try:
+                display_path, converted = convert_if_required(src, conversion_dir)
+            except Exception as e:
+                prepared.append(src)
+                conversion_errors.append(f"{src.name}: {e}")
+                continue
+
+            prepared.append(display_path)
+            if converted:
+                self.converted_image_sources[display_path] = src
+                converted_count += 1
+
+        if converted_count:
+            QMessageBox.information(
+                self,
+                "Converted scientific TIFFs",
+                f"Using converted PNGs for {converted_count} non-8-bit TIFF(s) in:\n{conversion_dir}",
+            )
+        if conversion_errors:
+            msg = "Some TIFFs could not be converted and will be opened directly:\n" + "\n".join(conversion_errors[:5])
+            if len(conversion_errors) > 5:
+                msg += f"\n...and {len(conversion_errors) - 5} more"
+            QMessageBox.warning(self, "TIFF conversion", msg)
+
+        return prepared, converted_count
 
     def set_output_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        d = QFileDialog.getExistingDirectory(self, "Select Output Folder", "", file_dialog_options())
         if not d: return
         self.out_dir = Path(d)
         self._update_status(f"Output → {self.out_dir}")
@@ -305,16 +448,37 @@ class SamPromptAnnotator(QMainWindow):
         ip = self.current_image_path()
         if not ip: return
 
-        pm = QPixmap(str(ip))
+        try:
+            t0 = time.perf_counter()
+            base_image = load_image_rgb(ip)
+            base_h, base_w = base_image.shape[:2]
+            self.current_base_size = (int(base_w), int(base_h))
+            image = preprocess_image_rgb(base_image, self._current_preprocess_settings())
+            view_h, view_w = image.shape[:2]
+            self.current_display_size = (int(view_w), int(view_h))
+            self.current_sam_image = image
+            pm = QPixmap.fromImage(np_to_qimage_rgb(image))
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            if dt_ms > 100:
+                print(f"Image load/preprocess: {dt_ms:.1f} ms for {ip.name} -> {view_w}x{view_h}")
+        except Exception as e:
+            self.current_base_size = (0, 0)
+            self.current_display_size = (0, 0)
+            self.current_sam_image = None
+            QMessageBox.critical(self, "Load error", f"Failed to load: {ip}\n\n{e}")
+            return
         if pm.isNull():
             QMessageBox.critical(self, "Load error", f"Failed to load: {ip}"); return
 
         self.pixmap_item = QGraphicsPixmapItem(pm); self.pixmap_item.setZValue(0)
+        self.pixmap_item.setTransformationMode(Qt.FastTransformation)
+        self.pixmap_item.setCacheMode(QGraphicsPixmapItem.DeviceCoordinateCache)
         W = self.pixmap_item.pixmap().width(); H = self.pixmap_item.pixmap().height()
         
         # clear per-image accumulated run history
         self.all_run_masks.clear()
         self.all_run_mask_classes.clear()
+        self.label_map = np.full((H, W), -1, dtype=np.int16)
         
         # also clear last preview masks
         self.last_masks = []
@@ -331,11 +495,202 @@ class SamPromptAnnotator(QMainWindow):
             if js.exists():
                 try:
                     with open(js, "r", encoding="utf-8") as f: data = json.load(f)
-                    self._load_from_json(data)
+                    if self._json_matches_current_preprocess(data):
+                        self._load_from_json(data)
+                    else:
+                        print(f"Skipped {js}: saved preprocessing does not match current view")
                 except Exception as e:
                     print(f"Failed to parse {js}: {e}")
 
         self._update_status(f"{ip.name} loaded")
+
+    def _current_sam_image_path(self, ip: Path) -> Path:
+        if self.current_sam_image is None:
+            raise RuntimeError("No preprocessed SAM image is loaded.")
+        settings = self._current_preprocess_settings()
+        cache_dir = Path(tempfile.gettempdir()) / "ultraprompt_sam_views"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            mtime_ns = ip.stat().st_mtime_ns
+        except Exception:
+            mtime_ns = 0
+        stem = f"{ip.stem}_px{settings.pixel_scale}_{settings.filter_name}_{self.current_display_size[0]}x{self.current_display_size[1]}_{mtime_ns}"
+        out = cache_dir / f"{stem}.png"
+        if not out.exists():
+            Image.fromarray(self.current_sam_image).save(out)
+        self.current_sam_image_path = out
+        return out
+
+    def _normalize_masks_for_view(self, masks: List[np.ndarray]) -> List[np.ndarray]:
+        view_w, view_h = self.current_display_size
+        normalized: List[np.ndarray] = []
+        for m in masks:
+            arr = np.asarray(m)
+            if arr.ndim == 3:
+                arr = np.squeeze(arr)
+            if arr.ndim != 2:
+                continue
+            if arr.shape != (view_h, view_w):
+                try:
+                    import cv2
+                    arr = cv2.resize(arr.astype(np.float32), (view_w, view_h), interpolation=cv2.INTER_NEAREST)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Mask shape {arr.shape} does not match current SAM view {(view_h, view_w)}"
+                    ) from e
+            normalized.append((arr > 0.5).astype(np.uint8))
+        return normalized
+
+    def _ensure_label_map(self) -> np.ndarray:
+        view_w, view_h = self.current_display_size
+        if self.label_map is None or self.label_map.shape != (view_h, view_w):
+            self.label_map = np.full((view_h, view_w), -1, dtype=np.int16)
+            for mask, cls_id in zip(self.all_run_masks, self.all_run_mask_classes):
+                arr = np.asarray(mask).astype(bool)
+                if arr.shape == self.label_map.shape:
+                    self.label_map[arr] = int(cls_id)
+        return self.label_map
+
+    def _sync_masks_from_label_map(self) -> None:
+        if self.label_map is None:
+            return
+        masks: List[np.ndarray] = []
+        classes: List[int] = []
+        for cls_id in sorted(int(v) for v in np.unique(self.label_map) if int(v) >= 0):
+            mask = (self.label_map == cls_id).astype(np.uint8)
+            if mask.any():
+                masks.append(mask)
+                classes.append(cls_id)
+        self.all_run_masks = masks
+        self.all_run_mask_classes = classes
+
+    def _draw_mask_overlay(self, masks: List[np.ndarray], classes: Optional[List[int]] = None) -> None:
+        if masks:
+            self._sync_label_map_from_masks(masks, classes)
+        self._draw_label_map_overlay()
+
+    def _sync_label_map_from_masks(self, masks: List[np.ndarray], classes: Optional[List[int]] = None) -> None:
+        if not masks:
+            return
+        H, W = masks[0].shape
+        self.label_map = np.full((H, W), -1, dtype=np.int16)
+        if classes is None or len(classes) != len(masks):
+            classes = [0] * len(masks)
+        for mask, cls_id in zip(masks, classes):
+            arr = np.asarray(mask).astype(bool)
+            if arr.shape == self.label_map.shape:
+                self.label_map[arr] = int(cls_id)
+        self._sync_masks_from_label_map()
+
+    def _draw_label_map_overlay(self) -> None:
+        if self.label_map is None or not (self.label_map >= 0).any():
+            if self.seg_item is not None:
+                self.scene.removeItem(self.seg_item)
+                self.seg_item = None
+            return
+        t0 = time.perf_counter()
+        H, W = self.label_map.shape
+        overlay = np.zeros((H, W, 4), dtype=np.uint8)
+        for cls_id in np.unique(self.label_map):
+            cls_id = int(cls_id)
+            if cls_id < 0:
+                continue
+            idx = self.label_map == cls_id
+            color = self._class_qcolor(cls_id)
+            overlay[idx, 0] = color.red()
+            overlay[idx, 1] = color.green()
+            overlay[idx, 2] = color.blue()
+            overlay[idx, 3] = int(0.45 * 255)
+        qimg = np_to_qimage_rgba(overlay)
+        pm = QPixmap.fromImage(qimg)
+        if self.seg_item is None:
+            self.seg_item = QGraphicsPixmapItem(pm)
+            self.seg_item.setTransformationMode(Qt.FastTransformation)
+            self.seg_item.setCacheMode(QGraphicsPixmapItem.DeviceCoordinateCache)
+            self.seg_item.setZValue(7.5)
+            self.scene.addItem(self.seg_item)
+        else:
+            self.seg_item.setPixmap(pm)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        if dt_ms > 50:
+            print(f"Overlay redraw: {dt_ms:.1f} ms at {W}x{H}")
+
+    def _append_accepted_masks(self, masks: List[np.ndarray], classes: List[int]) -> int:
+        label_map = self._ensure_label_map()
+        accepted = 0
+        for mask, cls_id in zip(masks, classes):
+            new_mask = np.asarray(mask).astype(bool)
+            if new_mask.shape != label_map.shape or not new_mask.any():
+                continue
+            new_mask &= label_map < 0
+            if not new_mask.any():
+                continue
+            label_map[new_mask] = int(cls_id)
+            accepted += 1
+        self._sync_masks_from_label_map()
+        return accepted
+
+    def _prune_empty_accepted_masks(self) -> None:
+        if self.label_map is not None:
+            self._sync_masks_from_label_map()
+            return
+        kept_masks: List[np.ndarray] = []
+        kept_classes: List[int] = []
+        for mask, cls_id in zip(self.all_run_masks, self.all_run_mask_classes):
+            arr = np.asarray(mask).astype(np.uint8)
+            if arr.any():
+                kept_masks.append(arr)
+                kept_classes.append(int(cls_id))
+        self.all_run_masks = kept_masks
+        self.all_run_mask_classes = kept_classes
+
+    def _remove_accepted_class_masks(self, cls_id: int) -> int:
+        label_map = self._ensure_label_map()
+        removed = 1 if np.any(label_map == int(cls_id)) else 0
+        label_map[label_map == int(cls_id)] = -1
+        self._sync_masks_from_label_map()
+        return removed
+
+    def _ensure_class_mask(self, cls_id: int) -> np.ndarray:
+        label_map = self._ensure_label_map()
+        mask = (label_map == int(cls_id)).astype(np.uint8)
+        return mask
+
+    def _brush_mask_at(self, x: float, y: float) -> Optional[np.ndarray]:
+        view_w, view_h = self.current_display_size
+        if view_w <= 0 or view_h <= 0:
+            return None
+        radius = int(self.spin_brush.value()) if hasattr(self, "spin_brush") else 12
+        radius = max(1, radius)
+        cx = int(round(x)); cy = int(round(y))
+        x0 = max(0, cx - radius); x1 = min(view_w, cx + radius + 1)
+        y0 = max(0, cy - radius); y1 = min(view_h, cy + radius + 1)
+        if x0 >= x1 or y0 >= y1:
+            return None
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        local = ((xx - cx) ** 2 + (yy - cy) ** 2) <= radius ** 2
+        brush = np.zeros((view_h, view_w), dtype=bool)
+        brush[y0:y1, x0:x1] = local
+        return brush
+
+    def _apply_brush_at(self, x: float, y: float, erase: bool, redraw: bool = False) -> bool:
+        brush = self._brush_mask_at(x, y)
+        if brush is None or not brush.any():
+            return False
+        label_map = self._ensure_label_map()
+        if erase:
+            label_map[brush] = -1
+        else:
+            label_map[brush] = int(self.current_class_id)
+        self._brush_dirty = True
+        if redraw:
+            self._draw_label_map_overlay()
+            self._brush_dirty = False
+        return True
+
+    def _redraw_accepted_overlay(self) -> None:
+        self._sync_masks_from_label_map()
+        self._draw_label_map_overlay()
 
     def _load_from_json(self, data: dict):
         W = self.pixmap_item.pixmap().width(); H = self.pixmap_item.pixmap().height()
@@ -377,6 +732,7 @@ class SamPromptAnnotator(QMainWindow):
         self.act_mode_points.setChecked(mode == "points")
         self.act_mode_boxes.setChecked(mode == "boxes")
         self.act_mode_concept.setChecked(mode == "concept")
+        self.act_mode_brush.setChecked(mode == "brush")
     
         is_concept = (mode == "concept")
     
@@ -416,6 +772,17 @@ class SamPromptAnnotator(QMainWindow):
 
     def _on_mouse_press(self, event):
         if not self.pixmap_item: return False
+        if self.mode == "brush":
+            if event.button() in (Qt.LeftButton, Qt.RightButton):
+                x, y = self._view_to_image_xy(event.pos())
+                self._brush_active = True
+                self._brush_erase = event.button() == Qt.RightButton
+                self._brush_dirty = False
+                self._last_brush_preview_ms = self._box_update_timer.elapsed()
+                self._apply_brush_at(x, y, erase=self._brush_erase, redraw=True)
+                action = "Erased" if self._brush_erase else f"Painted {self.class_names[self.current_class_id]}"
+                self._update_status(f"{action} brush at ({int(x)},{int(y)})")
+                return True
         if self.mode == "points":
             if event.button() in (Qt.LeftButton, Qt.RightButton):
                 x, y = self._view_to_image_xy(event.pos())
@@ -427,6 +794,7 @@ class SamPromptAnnotator(QMainWindow):
         elif self.mode in ("boxes", "concept") and event.button() == Qt.LeftButton:
             self._drawing_box = True
             self._box_start_scene = self.view.mapToScene(event.pos())
+            self._last_box_update_ms = self._box_update_timer.elapsed()
             self._current_box_item = self._make_box_item(QRectF(self._box_start_scene, self._box_start_scene),
                                                          self.current_class_id)
             self.scene.addItem(self._current_box_item)
@@ -434,7 +802,22 @@ class SamPromptAnnotator(QMainWindow):
         return False
 
     def _on_mouse_move(self, event):
+        if self.mode == "brush" and self._brush_active:
+            elapsed = self._box_update_timer.elapsed()
+            if elapsed - self._last_box_update_ms < 16:
+                return True
+            self._last_box_update_ms = elapsed
+            x, y = self._view_to_image_xy(event.pos())
+            redraw = elapsed - self._last_brush_preview_ms >= 120
+            changed = self._apply_brush_at(x, y, erase=self._brush_erase, redraw=redraw)
+            if changed and redraw:
+                self._last_brush_preview_ms = elapsed
+            return True
         if self.mode in ("boxes", "concept") and self._drawing_box and self._current_box_item is not None:
+            elapsed = self._box_update_timer.elapsed()
+            if elapsed - self._last_box_update_ms < 16:
+                return True
+            self._last_box_update_ms = elapsed
             now = self.view.mapToScene(event.pos())
             rect = QRectF(self._box_start_scene, now).normalized()
             rect = rect.intersected(self.pixmap_item.boundingRect())
@@ -443,6 +826,14 @@ class SamPromptAnnotator(QMainWindow):
         return False
 
     def _on_mouse_release(self, event):
+        if self.mode == "brush" and self._brush_active and event.button() in (Qt.LeftButton, Qt.RightButton):
+            self._brush_active = False
+            if self._brush_dirty:
+                self._redraw_accepted_overlay()
+                self._brush_dirty = False
+            self._brush_erase = False
+            self._update_status("Brush edit applied")
+            return True
         if self.mode in ("boxes", "concept") and self._drawing_box and event.button() == Qt.LeftButton:
             self._drawing_box = False
             if self._current_box_item:
@@ -473,9 +864,25 @@ class SamPromptAnnotator(QMainWindow):
 
     # ---------- Box styling ----------
     def _class_qcolor(self, cls_id: int) -> QColor:
-        rng = np.random.default_rng(12345 + int(cls_id))
-        r, g, b = [int(x) for x in rng.integers(60, 230, size=3)]
-        return QColor(r, g, b)
+        palette = [
+            QColor(230, 57, 70),    # red
+            QColor(42, 157, 143),   # teal
+            QColor(69, 123, 157),   # blue
+            QColor(244, 162, 97),   # orange
+            QColor(131, 56, 236),   # purple
+            QColor(255, 202, 58),   # yellow
+            QColor(6, 214, 160),    # mint
+            QColor(239, 71, 111),   # pink
+            QColor(58, 134, 255),   # bright blue
+            QColor(138, 201, 38),   # green
+            QColor(255, 127, 17),   # amber
+            QColor(91, 192, 190),   # cyan
+        ]
+        cls_id = max(0, int(cls_id))
+        if cls_id < len(palette):
+            return palette[cls_id]
+        hue = (cls_id * 137) % 360
+        return QColor.fromHsv(hue, 210, 230)
 
     def _apply_box_style(self, item: QGraphicsRectItem, cls_id: int):
         pen = QPen(self._class_qcolor(cls_id))
@@ -527,13 +934,18 @@ class SamPromptAnnotator(QMainWindow):
         pts  = [[float(x), float(y)] for (x,y,_) in self.point_data]
         labs = [int(l) for (_,_,l) in self.point_data]
         boxes = [[float(x0),float(y0),float(x1),float(y1)] for (x0,y0,x1,y1) in self.box_data]
-        return {
+        data = {
             "image": ip.name, "image_size": [int(W), int(H)],
             "point_coords": pts, "point_labels": labs,
             "boxes": boxes,
             "box_classes": [int(c) for c in self.box_classes],
-            "class_names": self.class_names
+            "class_names": self.class_names,
+            "preprocess": self._preprocess_metadata(),
         }
+        source_ip = self.converted_image_sources.get(ip)
+        if source_ip is not None:
+            data["source_image"] = source_ip.name
+        return data
 
     def save_current_json(self):
         ip = self.current_image_path()
@@ -555,14 +967,28 @@ class SamPromptAnnotator(QMainWindow):
         for i, p in enumerate(self.image_paths):
             jp = self.out_dir / f"{p.stem}.json"
             if jp.exists(): saved += 1; continue
-            pm = QPixmap(str(p))
+            try:
+                base_image = load_image_rgb(p)
+                base_h, base_w = base_image.shape[:2]
+                image = preprocess_image_rgb(base_image, self._current_preprocess_settings())
+                h, w = image.shape[:2]
+                preprocess = self._preprocess_metadata().copy()
+                preprocess["source_size"] = [int(base_w), int(base_h)]
+                preprocess["annotation_size"] = [int(w), int(h)]
+            except Exception:
+                w, h = 0, 0
+                preprocess = self._preprocess_metadata()
             data = {
                 "image": p.name,
-                "image_size": [pm.width(), pm.height()],
+                "image_size": [w, h],
                 "point_coords": [], "point_labels": [],
                 "boxes": [], "box_classes": [],
-                "class_names": self.class_names
+                "class_names": self.class_names,
+                "preprocess": preprocess,
             }
+            source_p = self.converted_image_sources.get(p)
+            if source_p is not None:
+                data["source_image"] = source_p.name
             with open(jp, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
             saved += 1
         self._update_status(f"Exported JSON for {saved} images")
@@ -573,6 +999,7 @@ class SamPromptAnnotator(QMainWindow):
             QMessageBox.information(self, "No image", "Load an image first.")
             return
     
+        self._sync_masks_from_label_map()
         # Prefer all_run_masks (append history) if present, else fallback to last_masks
         use_all = getattr(self, "all_run_masks", None) and len(self.all_run_masks) > 0
         source_masks = self.all_run_masks if use_all else getattr(self, "last_masks", None)
@@ -584,7 +1011,7 @@ class SamPromptAnnotator(QMainWindow):
     
         labels_dir = (self.out_dir / "labels") if self.out_dir else None
         if labels_dir is None:
-            d = QFileDialog.getExistingDirectory(self, "Select labels output folder")
+            d = QFileDialog.getExistingDirectory(self, "Select labels output folder", "", file_dialog_options())
             if not d:
                 return
             labels_dir = Path(d)
@@ -592,6 +1019,11 @@ class SamPromptAnnotator(QMainWindow):
     
         W = self.pixmap_item.pixmap().width()
         H = self.pixmap_item.pixmap().height()
+        base_w, base_h = self.current_base_size
+        if base_w <= 0 or base_h <= 0:
+            base_w, base_h = W, H
+        sx = float(base_w) / float(W) if W else 1.0
+        sy = float(base_h) / float(H) if H else 1.0
         label_path = labels_dir / f"{ip.stem}.txt"
     
         # Convert every source mask to polygons (preserve order)
@@ -619,7 +1051,7 @@ class SamPromptAnnotator(QMainWindow):
         for cid, poly in zip(class_ids, polys):
             if poly is None:
                 continue
-            final_polys.append(poly)
+            final_polys.append(scale_polygon(poly, sx, sy))
             final_class_ids.append(int(cid))
     
         if not final_polys:
@@ -628,7 +1060,7 @@ class SamPromptAnnotator(QMainWindow):
     
         # Write YOLO segmentation file
         try:
-            write_yolo_seg(label_path, final_polys, final_class_ids, W, H)
+            write_yolo_seg(label_path, final_polys, final_class_ids, base_w, base_h)
         except Exception as e:
             QMessageBox.critical(self, "Write error", f"Failed to write YOLO labels: {e}")
             return
@@ -638,6 +1070,8 @@ class SamPromptAnnotator(QMainWindow):
             if self.out_dir:
                 json_path = self.out_dir / f"{ip.stem}.json"
                 data = self._annotation_dict()
+                data["pred_instances_space"] = "source_image"
+                data["pred_instances_image_size"] = [int(base_w), int(base_h)]
                 data["pred_instances"] = []
                 for cls_id, poly in zip(final_class_ids, final_polys):
                     if poly is None:
@@ -671,7 +1105,7 @@ class SamPromptAnnotator(QMainWindow):
         self._update_status("Device set")
 
     def load_sam3_weights(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Select SAM3 weights (.pt)", "", "Model files (*.pt)")
+        f, _ = QFileDialog.getOpenFileName(self, "Select SAM3 weights (.pt)", "", "Model files (*.pt)", options=file_dialog_options())
         if not f:
             return
         self.sam3_weights = Path(f)
@@ -692,7 +1126,7 @@ class SamPromptAnnotator(QMainWindow):
         if self.seg_item is not None:
             self.scene.removeItem(self.seg_item)
             self.seg_item = None
-        self._update_status("Cleared accumulated masks")
+        self._update_status("Cleared accepted masks")
 
     
     def run_sam3(self):
@@ -704,69 +1138,34 @@ class SamPromptAnnotator(QMainWindow):
             QMessageBox.warning(self, "SAM3 weights missing", "Load sam3.pt first (Load SAM3 Weights…).")
             return
         try:
-            image = load_image_rgb(ip)
+            image = self.current_sam_image
+            if image is None:
+                image = preprocess_image_rgb(load_image_rgb(ip), self._current_preprocess_settings())
+                self.current_sam_image = image
+            sam_image_path = self._current_sam_image_path(ip)
         except Exception as e:
             QMessageBox.critical(self, "Image load error", str(e)); return
-    
+
         masks_to_draw: List[np.ndarray] = []
         mask_classes: List[int] = []
         try:
-            # Bind image once
-            self.sam.bind_image(image, image_path=str(ip))
-    
+            self.sam.bind_image(image, image_path=str(sam_image_path))
+
             has_points = len(self.point_data) > 0
             has_boxes  = len(self.box_data) > 0
-    
-            # Concept mode uses SAM3SemanticPredictor: text prompts and/or exemplar boxes.
+
             is_concept = (self.mode == "concept") or (self.concept_text.strip() != "")
-    
+            is_points_prompt = (not is_concept) and has_points and not has_boxes
+
             if is_concept:
                 text_prompts = [t.strip() for t in self.concept_text.split(",") if t.strip()]
-                exemplars = self.box_data if has_boxes else None  # drawn boxes used as exemplars
-            
-                # Always re-bind image with a string path
-                self.sam.bind_image(image, image_path=str(ip))
-            
-                # Call SAM3 semantic predictor; receive list of masks
+                exemplars = self.box_data if has_boxes else None
                 masks_to_draw = self.sam.infer_concept(text=text_prompts or None, exemplars=exemplars)
-            
-                if not masks_to_draw:
-                    QMessageBox.information(self, "No masks", "SAM3 returned no masks.")
-                    return
-            
-                # Normalize masks to uint8 {0,1} and prepare preview overlay for the *last run*
-                normalized_masks = []
-                for m in masks_to_draw:
-                    arr = np.asarray(m)
-                    if arr.dtype != np.uint8:
-                        arr = (arr > 0).astype(np.uint8)
-                    normalized_masks.append(arr)
-            
-                # Update preview-compatible fields
-                self.last_masks = normalized_masks
-                self.last_mask_classes = [int(self.current_class_id)] * len(normalized_masks)
-            
-                # Append each returned mask to the append-only history with the current class id
-                for nm in normalized_masks:
-                    self.all_run_masks.append(nm)
-                    self.all_run_mask_classes.append(int(self.current_class_id))
-            
-                # Build preview overlay from last_masks (optional — keeps current UI behavior)
-                overlay = colorize_masks_rgba(self.last_masks, alpha=0.45)
-                qimg = np_to_qimage_rgba(overlay)
-                pm = QPixmap.fromImage(qimg)
-                if self.seg_item is not None:
-                    self.scene.removeItem(self.seg_item); self.seg_item = None
-                self.seg_item = QGraphicsPixmapItem(pm)
-                self.seg_item.setZValue(7.5)
-                self.scene.addItem(self.seg_item)
-            
-                self._update_status(f"Concept run: appended {len(normalized_masks)} masks for class {self.class_names[self.current_class_id]}.")
-                
+                mask_classes = [int(self.current_class_id)] * len(masks_to_draw)
             else:
                 pts  = [[x, y] for (x, y, _) in self.point_data] if has_points else None
                 labs = [int(l) for (_, _, l) in self.point_data] if has_points else None
-    
+
                 if has_boxes:
                     masks_to_draw = self.sam.infer_visual(points=pts, labels=labs, boxes=self.box_data, multimask_output=True)
                     mask_classes  = list(self.box_classes)
@@ -776,31 +1175,46 @@ class SamPromptAnnotator(QMainWindow):
                 else:
                     masks_to_draw = self.sam.segment_everything(image, top_n=20)
                     mask_classes  = [int(self.current_class_id)] * len(masks_to_draw)
-    
-            if not masks_to_draw:
+
+            normalized_masks = self._normalize_masks_for_view(masks_to_draw)
+            if not normalized_masks:
+                if is_points_prompt:
+                    self._redraw_accepted_overlay()
+                    self._update_status("No mask returned; kept existing accepted mask and all points remain active.")
+                    return
                 QMessageBox.information(self, "No masks", "SAM3 returned no masks."); return
-    
-            overlay = colorize_masks_rgba(masks_to_draw, alpha=0.45)
-            qimg = np_to_qimage_rgba(overlay)
-            pm = QPixmap.fromImage(qimg)
-            if self.seg_item is not None:
-                self.scene.removeItem(self.seg_item); self.seg_item = None
-            self.seg_item = QGraphicsPixmapItem(pm)
-            self.seg_item.setZValue(7.5)
-            self.scene.addItem(self.seg_item)
-            self.last_masks = masks_to_draw
+
+            if len(mask_classes) != len(normalized_masks):
+                mask_classes = [int(self.current_class_id)] * len(normalized_masks)
+
+            self.last_masks = normalized_masks
             self.last_mask_classes = mask_classes
-            self._update_status("Segmentation overlay updated (SAM3).")
-    
+            replaced = 0
+            if is_points_prompt:
+                replaced = self._remove_accepted_class_masks(self.current_class_id)
+            accepted = self._append_accepted_masks(normalized_masks, mask_classes)
+            self._redraw_accepted_overlay()
+
+            if is_concept:
+                self._update_status(f"Concept run: accepted {accepted} masks for class {self.class_names[self.current_class_id]}.")
+            elif is_points_prompt:
+                if accepted:
+                    self._update_status(f"Updated class {self.class_names[self.current_class_id]} from {len(self.point_data)} points; replaced {replaced}, accepted {accepted}.")
+                else:
+                    self._update_status(f"No unclaimed pixels accepted for class {self.class_names[self.current_class_id]}; existing labels kept priority.")
+            else:
+                self._update_status(f"Accepted {accepted} masks. Total accepted: {len(self.all_run_masks)}.")
+
         except Exception as e:
             tb = traceback.format_exc()
-            print(tb)  # also print to terminal/log
+            print(tb)
             QMessageBox.critical(self, "SAM3 error", tb)
 
 
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
 
     # ── Main window with two tabs ──────────────────────────────────────
     from PySide6.QtWidgets import QMainWindow, QTabWidget
@@ -813,11 +1227,26 @@ def main():
 
     # Tab 1 — existing SAM3 annotator
     annotator = SamPromptAnnotator()
-    tabs.addTab(annotator, '🖼️  SAM3 Annotate')
+    tabs.addTab(annotator, 'SAM3 Annotate')
 
-    # Tab 2 — new YOLO training tab
-    yolo_tab = YoloTrainingTab()
-    tabs.addTab(yolo_tab, '🏋️  YOLO Training')
+    # Tab 2 — lazy-load YOLO training UI only when opened.
+    yolo_placeholder = QWidget()
+    yolo_layout = QVBoxLayout(yolo_placeholder)
+    yolo_layout.addWidget(QLabel("YOLO Training"))
+    tabs.addTab(yolo_placeholder, 'YOLO Training')
+    yolo_loaded = {"done": False}
+
+    def _load_yolo_tab(index):
+        if index != 1 or yolo_loaded["done"]:
+            return
+        from ultraprompt.gui.yolo_training_tab import YoloTrainingTab
+        yolo_tab = YoloTrainingTab()
+        tabs.removeTab(1)
+        tabs.insertTab(1, yolo_tab, 'YOLO Training')
+        tabs.setCurrentIndex(1)
+        yolo_loaded["done"] = True
+
+    tabs.currentChanged.connect(_load_yolo_tab)
 
     main_win.show()
     sys.exit(app.exec_())

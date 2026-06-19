@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -18,14 +18,26 @@ try:
 except Exception:
     _HAS_PIL = False
 
-from ultralytics import SAM
-try:
-    # SAM 3 semantic (concept) segmentation predictor
-    from ultralytics.models.sam import SAM3SemanticPredictor
-    _HAS_SAM3_SEMANTIC = True
-except Exception:
-    SAM3SemanticPredictor = None  # type: ignore
-    _HAS_SAM3_SEMANTIC = False
+SAM: Any = None
+SAM3SemanticPredictor: Any = None
+_HAS_SAM3_SEMANTIC = False
+
+
+def _import_ultralytics_sam() -> None:
+    """Import Ultralytics only when SAM weights are actually loaded."""
+    global SAM, SAM3SemanticPredictor, _HAS_SAM3_SEMANTIC
+    if SAM is not None:
+        return
+
+    from ultralytics import SAM as _SAM
+    SAM = _SAM
+    try:
+        from ultralytics.models.sam import SAM3SemanticPredictor as _SAM3SemanticPredictor
+        SAM3SemanticPredictor = _SAM3SemanticPredictor
+        _HAS_SAM3_SEMANTIC = True
+    except Exception:
+        SAM3SemanticPredictor = None
+        _HAS_SAM3_SEMANTIC = False
 
 
 
@@ -149,8 +161,12 @@ def _best_mask_from_results(res_list) -> Optional[np.ndarray]:
         return None
     mm = res.masks.data  # tensor (N,H,W) float
     m = mm.cpu().numpy()
-    if m.ndim == 3 and m.shape[0] > 1:
+    if m.ndim != 3 or m.shape[0] == 0:
+        return None
+    if m.shape[0] > 1:
         areas = m.reshape(m.shape[0], -1).sum(1)
+        if areas.size == 0:
+            return None
         m = m[int(np.argmax(areas))]
     else:
         m = m[0]
@@ -167,7 +183,7 @@ def _all_masks_from_results(res_list) -> List[np.ndarray]:
         return []
     mm = res.masks.data  # tensor (N,H,W) float
     m = mm.cpu().numpy()
-    if m.ndim != 3:
+    if m.ndim != 3 or m.shape[0] == 0:
         return []
     return [(m[i] > 0.5).astype(bool) for i in range(m.shape[0])]
 
@@ -188,24 +204,32 @@ def colorize_masks_rgba(masks: List[np.ndarray], alpha: float = 0.45) -> Optiona
     return out
 
 
-def mask_to_polygon(mask: np.ndarray, simplify_eps: float = 2.0) -> Optional[np.ndarray]:
-    """Largest external contour as polygon (Nx2) in pixel coords."""
+def mask_to_polygons(mask: np.ndarray, simplify_eps: float = 2.0, min_area: float = 0.0) -> List[np.ndarray]:
+    """External contours as polygons (Nx2) in pixel coords, largest first."""
     if not _HAS_CV2:
-        raise RuntimeError("OpenCV required for mask_to_polygon.")
+        raise RuntimeError("OpenCV required for mask_to_polygons.")
     H, W = mask.shape
     m8 = (mask.astype(np.uint8) * 255)
     cnts, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    cnt = max(cnts, key=cv2.contourArea)
-    if simplify_eps and simplify_eps > 0:
-        cnt = cv2.approxPolyDP(cnt, epsilon=simplify_eps, closed=True)
-    poly = cnt.reshape(-1, 2)
-    if poly.shape[0] < 3:
-        return None
-    poly[:, 0] = np.clip(poly[:, 0], 0, W - 1)
-    poly[:, 1] = np.clip(poly[:, 1], 0, H - 1)
-    return poly.astype(np.float32)
+    polys: List[np.ndarray] = []
+    for cnt in sorted(cnts, key=cv2.contourArea, reverse=True):
+        if min_area and cv2.contourArea(cnt) < float(min_area):
+            continue
+        if simplify_eps and simplify_eps > 0:
+            cnt = cv2.approxPolyDP(cnt, epsilon=simplify_eps, closed=True)
+        poly = cnt.reshape(-1, 2)
+        if poly.shape[0] < 3:
+            continue
+        poly[:, 0] = np.clip(poly[:, 0], 0, W - 1)
+        poly[:, 1] = np.clip(poly[:, 1], 0, H - 1)
+        polys.append(poly.astype(np.float32))
+    return polys
+
+
+def mask_to_polygon(mask: np.ndarray, simplify_eps: float = 2.0) -> Optional[np.ndarray]:
+    """Largest external contour as polygon (Nx2) in pixel coords."""
+    polys = mask_to_polygons(mask, simplify_eps=simplify_eps)
+    return polys[0] if polys else None
 
 
 def write_yolo_seg(label_path: Path,
@@ -264,7 +288,7 @@ class UltraSAM3:
 
     def __init__(self) -> None:
         # Visual model (SAM interface) - supports SAM2 + SAM3 PVS
-        self.model: Optional[SAM] = None
+        self.model: Optional[Any] = None
         # Semantic predictor (SAM3 PCS)
         self.semantic: Optional["SAM3SemanticPredictor"] = None  # type: ignore[name-defined]
         self._device: str = "cpu"
@@ -289,6 +313,7 @@ class UltraSAM3:
         verbose: bool = False,
     ) -> None:
         """Load SAM weights and (optionally) initialize SAM3 semantic predictor."""
+        _import_ultralytics_sam()
         self._device = effective_device(device)
 
         # Visual prompting model (works for sam3.pt too)
@@ -315,7 +340,7 @@ class UltraSAM3:
             )
             try:
                 self.semantic = SAM3SemanticPredictor(overrides=self._semantic_overrides)  # type: ignore[call-arg]
-            except Exception:
+            except Exception as e:
                 # Keep visual segmentation working even if semantic init fails.
                 print("SAM3SemanticPredictor init failed:", e)
                 self.semantic = None
@@ -408,10 +433,11 @@ class UltraSAM3:
         masks_out: List[np.ndarray] = []
         if res.masks is not None:
             mm = res.masks.data.cpu().numpy()  # (N,H,W)
-            areas = mm.reshape(mm.shape[0], -1).sum(1)
-            keep = np.argsort(-areas)[:min(top_n, mm.shape[0])]
-            for i in keep:
-                masks_out.append((mm[i] > 0.5).astype(bool))
+            if mm.ndim == 3 and mm.shape[0] > 0:
+                areas = mm.reshape(mm.shape[0], -1).sum(1)
+                keep = np.argsort(-areas)[:min(top_n, mm.shape[0])]
+                for i in keep:
+                    masks_out.append((mm[i] > 0.5).astype(bool))
         return masks_out
 
     # ---------- Concept segmentation (SAM3 PCS prompts) ----------

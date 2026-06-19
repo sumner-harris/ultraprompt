@@ -5,6 +5,13 @@ from .sam_yolo_annotation import (
     mask_to_polygon,
     write_yolo_seg,
 )
+from .image_preprocessing import (
+    ImagePreprocessSettings,
+    preprocess_image_rgb,
+    resize_for_pixel_scale,
+    apply_filter,
+    scale_polygon,
+)
 
 __all__ = [
     "UltraSAM2",
@@ -12,4 +19,9 @@ __all__ = [
     "colorize_masks_rgba",
     "mask_to_polygon",
     "write_yolo_seg",
+    "ImagePreprocessSettings",
+    "preprocess_image_rgb",
+    "resize_for_pixel_scale",
+    "apply_filter",
+    "scale_polygon",
 ]

@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ultraprompt web</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-theme="dark">
+  <header class="topbar">
+    <div class="field grow"><label>Images</label><div class="path-row"><input id="imageDir" type="text" placeholder="/path/to/images"><button id="browseImages" type="button">Browse</button></div></div>
+    <div class="field grow"><label>Output</label><div class="path-row"><input id="outDir" type="text" placeholder="optional"><button id="browseOutput" type="button">Browse</button></div></div>
+    <button id="openFolder" type="button">Open</button>
+    <div class="sep"></div>
+    <div class="field grow"><label>SAM weights</label><div class="path-row"><input id="weightsPath" type="text" placeholder="/path/to/sam3.pt"><button id="browseWeights" type="button">Browse</button></div></div>
+    <select id="device"><option value="auto">Auto</option><option value="cuda">CUDA</option><option value="cpu">CPU</option></select>
+    <button id="loadWeights" type="button">Load</button>
+    <button id="themeToggle" type="button">Light</button>
+  </header>
+
+  <nav class="page-tabs">
+    <button id="tabAnnotate" class="active" type="button">Annotate</button>
+    <button id="tabYolo" type="button">YOLO Training</button>
+    <button id="tabInfer" type="button">YOLO Inference</button>
+  </nav>
+
+  <main id="annotatePage" class="app page active">
+    <aside class="sidebar annotate-sidebar">
+      <section>
+        <label>Image</label>
+        <select id="imageSelect"></select>
+        <div class="row"><button id="prevImage" type="button">Prev</button><button id="nextImage" type="button">Next</button></div>
+      </section>
+
+      <section>
+        <label>Classes</label>
+        <textarea id="classesText" rows="4">object</textarea>
+        <div class="row"><button id="setClasses" type="button">Set Classes</button><button id="browseClasses" type="button">Load classes.txt</button></div>
+        <label>Active Class</label>
+        <select id="classSelect"></select>
+      </section>
+
+      <section>
+        <label>View</label>
+        <div class="row">
+          <select id="pixelScale"><option value="1">1x</option><option value="2">2x</option><option value="4" selected>4x</option><option value="8">8x</option></select>
+          <select id="filterName"><option value="none">None</option><option value="gaussian">Gaussian</option><option value="median">Median</option><option value="bilateral">Bilateral</option><option value="dog_fine">DoG Fine</option><option value="dog_medium">DoG Medium</option><option value="dog_coarse">DoG Coarse</option><option value="sharpen">Sharpen</option></select>
+        </div>
+        <div class="row"><button id="zoomOut" type="button">Zoom -</button><button id="zoomIn" type="button">Zoom +</button></div>
+        <div class="row"><button id="zoomFit" type="button">Fit</button><button id="zoomReset" type="button">100%</button></div>
+        <div id="zoomReadout" class="zoom-readout">100%</div>
+      </section>
+
+      <section>
+        <label>Mode</label>
+        <div class="segmented">
+          <button data-mode="points" class="active" type="button">Points</button>
+          <button data-mode="boxes" type="button">Boxes</button>
+          <button data-mode="concept" type="button">Concept</button>
+          <button data-mode="brush" type="button">Brush</button>
+        </div>
+        <input id="conceptText" type="text" placeholder="concept prompt">
+        <label>Brush Size</label>
+        <input id="brushSize" type="range" min="1" max="120" value="12">
+      </section>
+
+      <section class="action-grid">
+        <button id="runSam" class="primary" type="button">Run SAM</button>
+        <button id="saveYolo" type="button">Save Labels</button>
+        <button id="undoAction" type="button">Undo</button>
+        <button id="clearPoints" type="button">Clear Points</button>
+        <button id="clearBoxes" type="button">Clear Boxes</button>
+        <button id="clearPrompts" type="button">Clear Prompts</button>
+        <button id="clearLabels" type="button">Clear Labels</button>
+        <button id="clearAll" type="button">Clear All</button>
+      </section>
+    </aside>
+
+    <section id="annotateWorkarea" class="workarea annotate-workarea">
+      <div id="canvasShell" class="canvas-shell">
+        <div id="canvasWrap" class="canvas-wrap">
+          <canvas id="imageCanvas"></canvas>
+          <canvas id="labelCanvas"></canvas>
+          <canvas id="vectorCanvas"></canvas>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <main id="yoloPage" class="app page hidden">
+    <aside class="sidebar yolo-sidebar">
+      <section>
+        <label>Task</label>
+        <select id="yoloTask"><option value="segment">Instance (*-seg)</option><option value="semantic">Semantic (*-sem)</option></select>
+        <label>Model</label>
+        <select id="yoloModel"></select>
+        <label>Device</label>
+        <div class="path-row"><select id="yoloDevice"><option value="cpu">cpu</option></select><button id="refreshYoloDevices" type="button">Refresh</button></div>
+        <label><input id="yoloAutoWeights" type="checkbox" checked> Auto-download weights</label>
+        <label>Custom Weights</label>
+        <div class="path-row"><input id="yoloWeightsPath" type="text" disabled><button id="browseYoloWeights" type="button" disabled>Browse</button></div>
+      </section>
+
+      <section>
+        <label>Dataset Images</label>
+        <div class="path-row"><input id="yoloImagesDir" type="text" placeholder="images folder"><button id="browseYoloImages" type="button">Browse</button></div>
+        <label id="yoloAnnoLabel">Dataset Labels</label>
+        <div class="path-row"><input id="yoloLabelsDir" type="text" placeholder="labels folder (.txt) or masks folder (.png)"><button id="browseYoloLabels" type="button">Browse</button></div>
+        <label>Dataset Output</label>
+        <div class="path-row"><input id="yoloDatasetOut" type="text" placeholder="dataset output"><button id="browseYoloDatasetOut" type="button">Browse</button></div>
+        <label>classes.txt</label>
+        <div class="path-row"><input id="yoloClassesPath" type="text" placeholder="optional classes.txt"><button id="browseYoloClasses" type="button">Browse</button></div>
+        <label>Class Names</label>
+        <input id="yoloClasses" type="text" value="vacuum, Pt, ionomer">
+        <div class="tri-row">
+          <label>Train %<input id="yoloTrainPct" type="number" value="80" min="50" max="100"></label>
+          <label>Val %<input id="yoloValPct" type="number" value="10" min="0" max="50"></label>
+          <label>Seed<input id="yoloDatasetSeed" type="number" value="42"></label>
+        </div>
+        <label><input id="yoloUseTestSplit" type="checkbox" checked> Use test split</label>
+        <button id="buildYoloDataset" class="primary" type="button">Build Dataset + data.yaml</button>
+      </section>
+
+      <section>
+        <label>Training Output</label>
+        <div class="path-row"><input id="yoloOutputDir" type="text" placeholder="training output"><button id="browseYoloOutput" type="button">Browse</button></div>
+        <label>Run Name</label>
+        <input id="yoloRunName" type="text" value="yolo_run_1">
+        <label>data.yaml</label>
+        <div class="path-row"><input id="yoloDataYaml" type="text"><button id="browseYoloYaml" type="button">Browse</button></div>
+      </section>
+
+      <section>
+        <div class="param-grid">
+          <label>Epochs<input id="yoloEpochs" type="number" value="200"></label>
+          <label>Image Size<input id="yoloImgsz" type="number" value="1280"></label>
+          <label>Batch<input id="yoloBatch" type="number" value="8"></label>
+          <label>Patience<input id="yoloPatience" type="number" value="50"></label>
+          <label>workers<input id="yoloWorkers" type="number" value="4"></label>
+          <label>seed<input id="yoloSeed" type="number" value="42"></label>
+          <label>cls<input id="yoloCls" type="number" step="0.001" value="0.391"></label>
+          <label>conf<input id="yoloConf" type="number" step="0.001" value="0.276"></label>
+          <label>dropout<input id="yoloDropout" type="number" step="0.001" value="0.248"></label>
+          <label>mask ratio<input id="yoloMaskRatio" type="number" value="4"></label>
+          <label>box<input id="yoloBox" type="number" step="0.001" value="11.779"></label>
+        </div>
+        <label><input id="yoloAutoOptimize" type="checkbox" checked> Auto optimizer + learning rate</label>
+        <div class="param-grid">
+          <label>Optimizer<select id="yoloOptimizer"><option value="SGD">SGD</option><option value="Adam">Adam</option><option value="AdamW" selected>AdamW</option><option value="RMSProp">RMSProp</option></select></label>
+          <label>lr0<input id="yoloLr0" type="number" step="0.000001" value="0.000503"></label>
+        </div>
+      </section>
+
+      <section>
+        <label>Augmentation</label>
+        <div class="param-grid">
+          <label>fliplr<input id="yoloFlipLR" type="number" step="0.01" min="0" max="1" value="0.5"></label>
+          <label>flipud<input id="yoloFlipUD" type="number" step="0.01" min="0" max="1" value="0.0"></label>
+          <label>scale<input id="yoloScale" type="number" step="0.01" min="0" value="0.5"></label>
+          <label>translate<input id="yoloTranslate" type="number" step="0.01" min="0" max="1" value="0.1"></label>
+          <label>mosaic<input id="yoloMosaic" type="number" step="0.01" min="0" max="1" value="0.0"></label>
+          <label>mixup<input id="yoloMixup" type="number" step="0.01" min="0" max="1" value="0.0"></label>
+        </div>
+      </section>
+
+      <section>
+        <label><input id="yoloSave" type="checkbox" checked> Save best.pt and last.pt</label>
+        <label><input id="yoloPlots" type="checkbox" checked> Save YOLO plots</label>
+        <label><input id="yoloAmp" type="checkbox" checked> AMP mixed precision</label>
+        <label><input id="yoloVerbose" type="checkbox" checked> Verbose output</label>
+        <label><input id="yoloSavePeriod" type="checkbox" checked> Checkpoint every 25 epochs</label>
+        <div class="row"><button id="startYoloTraining" class="primary" type="button">Start Training</button><button id="stopYoloTraining" type="button">Stop</button></div>
+        <label>Load Existing results.csv</label>
+        <div class="path-row"><input id="yoloResultsPath" type="text"><button id="browseYoloResults" type="button">Browse</button></div>
+        <button id="loadYoloResults" type="button">Load Results</button>
+      </section>
+    </aside>
+
+    <section class="workarea yolo-workarea">
+      <div class="yolo-status"><span id="yoloStatus">Idle</span><span id="yoloEpoch">Epoch: -</span></div>
+      <div class="plot-grid">
+        <canvas id="yoloLossChart" width="520" height="240"></canvas>
+        <canvas id="yoloMapChart" width="520" height="240"></canvas>
+      </div>
+      <pre id="yoloMetrics" class="metrics-box">Metrics will appear here.</pre>
+      <img id="yoloConfusion" class="confusion hidden" alt="Confusion matrix">
+      <pre id="yoloLog" class="log-box"></pre>
+    </section>
+  </main>
+
+  <main id="inferPage" class="app page hidden">
+    <aside class="sidebar infer-sidebar">
+      <section>
+        <label>Task</label>
+        <select id="inferTask"><option value="segment">Instance (*-seg)</option><option value="semantic">Semantic (*-sem)</option></select>
+        <label>Model</label>
+        <select id="inferModel"></select>
+        <label>Device</label>
+        <div class="path-row"><select id="inferDevice"><option value="cpu">cpu</option></select><button id="refreshInferDevices" type="button">Refresh</button></div>
+        <label><input id="inferAutoWeights" type="checkbox" checked> Auto-download weights</label>
+        <label>Custom Weights</label>
+        <div class="path-row"><input id="inferWeightsPath" type="text" disabled><button id="browseInferWeights" type="button" disabled>Browse</button></div>
+      </section>
+
+      <section>
+        <label>Inference Images</label>
+        <div class="path-row"><input id="inferImagesDir" type="text" placeholder="images folder"><button id="browseInferImages" type="button">Browse</button></div>
+        <label>Output Folder</label>
+        <div class="path-row"><input id="inferOutputDir" type="text" placeholder="optional output folder"><button id="browseInferOutput" type="button">Browse</button></div>
+        <div class="param-grid">
+          <label>Confidence<input id="inferConf" type="number" step="0.01" min="0" max="1" value="0.25"></label>
+          <label>Image Size<input id="inferImgsz" type="number" value="1280"></label>
+        </div>
+      </section>
+
+      <section>
+        <label>Image</label>
+        <select id="inferImageSelect"></select>
+        <div class="row"><button id="inferPrevImage" type="button">Prev</button><button id="inferNextImage" type="button">Next</button></div>
+        <div class="row"><button id="inferZoomOut" type="button">Zoom -</button><button id="inferZoomIn" type="button">Zoom +</button></div>
+        <div class="row"><button id="inferZoomFit" type="button">Fit</button><button id="inferZoomReset" type="button">100%</button></div>
+        <div id="inferZoomReadout" class="zoom-readout">100%</div>
+      </section>
+
+      <section>
+        <label>Scope</label>
+        <select id="inferScope"><option value="all">All images in folder</option><option value="current">Current selected image</option></select>
+        <label><input id="inferSaveOverlays" type="checkbox" checked> Save overlays</label>
+        <label><input id="inferSavePredictions" type="checkbox" checked> <span id="inferSavePredictionsText">Save labels + boxes</span></label>
+        <button id="runInfer" class="primary" type="button">Run Inference</button>
+      </section>
+
+      <section>
+        <div class="yolo-status"><span id="inferStatus">Idle</span></div>
+        <pre id="inferSummary" class="metrics-box">Inference results will appear here.</pre>
+      </section>
+    </aside>
+
+    <section id="inferWorkarea" class="workarea annotate-workarea">
+      <div id="inferCanvasShell" class="canvas-shell">
+        <div id="inferCanvasWrap" class="canvas-wrap">
+          <canvas id="inferImageCanvas"></canvas>
+          <canvas id="inferOverlayCanvas"></canvas>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="fileDialog" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-panel">
+      <div class="modal-head">
+        <div>
+          <strong id="fileDialogTitle">Browse VM Files</strong>
+          <div id="fileDialogPath" class="modal-path"></div>
+        </div>
+        <button id="closeFileDialog" type="button">Close</button>
+      </div>
+      <div id="fileBreadcrumbs" class="breadcrumbs"></div>
+      <div class="browser-layout">
+        <aside id="fileRoots" class="roots-pane"></aside>
+        <div class="browser-main">
+          <div class="modal-actions">
+            <button id="fileParent" type="button">Up</button>
+            <button id="newFolder" type="button">New Folder</button>
+            <button id="selectCurrent" type="button">Select Current Folder</button>
+          </div>
+          <div class="file-header"><span>Name</span><span>Type</span><span>Action</span></div>
+          <div id="fileEntries" class="file-entries"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer id="status" class="status">Ready</footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

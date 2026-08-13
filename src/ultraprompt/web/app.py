@@ -610,7 +610,7 @@ def _read_results(results_csv: Path) -> dict[str, Any]:
 
 def _resolve_yolo_weights(task: str, model: str, auto_weights: bool, custom_weights: Optional[str]) -> str:
     if auto_weights:
-        return model
+        return model if model.endswith((".pt", ".yaml", ".yml")) else f"{model}.pt"
     if not custom_weights:
         raise HTTPException(status_code=400, detail="Custom weights path is required when auto weights is off.")
     path = _norm_path(custom_weights)

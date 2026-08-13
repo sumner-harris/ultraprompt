@@ -14,7 +14,7 @@ license = {text = "MIT"}
 keywords = ["segmentation", "SAM2", "YOLO", "annotation", "Ultralytics"]
 
 dependencies = [
-  "ultralytics>=8.4.9",
+  "ultralytics>=8.4.52",
   "torch>=2.10.0",               # CPU by default; use CUDA index for GPU
   "torchvision>=0.25.0",        # keep paired with your torch version
   "PySide6>=6.10.1",
